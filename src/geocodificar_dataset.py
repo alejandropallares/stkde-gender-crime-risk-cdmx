@@ -2,8 +2,12 @@
 Script para geocodificar registros con coordenadas faltantes ("SIN REGISTRO")
 usando la API de Geocoding de Google Maps.
 
+Exporta el resultado en CSV con columnas de control:
+  - ENVIADO_API: SI / NO
+  - estado: vacío, para llenar manualmente con "correcto" o "incorrecto"
+
 Uso:
-    python geocodificar_dataset.py --input ruta/al/archivo.xlsx
+    python geocodificar_dataset.py --input ruta/al/archivo.csv
 
 Requiere un archivo .env con la variable GOOGLE_MAPS_API_KEY.
 """
@@ -19,7 +23,6 @@ from pathlib import Path
 import googlemaps
 import pandas as pd
 from dotenv import load_dotenv
-from openpyxl.styles import PatternFill
 from tqdm import tqdm
 import os
 
@@ -34,6 +37,8 @@ COL_COLONIA = "COLONIA HECHOS"
 COL_ALCALDIA = "ALCALDÍA HECHOS"
 COL_COORD_X = "COORD. X"  # Longitud (WGS84)
 COL_COORD_Y = "COORD. Y"  # Latitud (WGS84)
+COL_ENVIADO_API = "ENVIADO_API"
+COL_ESTADO = "estado"
 
 # Marcador de coordenadas faltantes en el dataset original
 SIN_REGISTRO = "SIN REGISTRO"
@@ -44,9 +49,6 @@ INTERVALO_BACKUP = 50
 
 # Pausa entre peticiones a Google (segundos) para respetar rate limits
 PAUSA_ENTRE_PETICIONES = 0.1
-
-# Color naranja para filas geocodificadas vía API en el Excel de salida
-FILL_NARANJA = PatternFill(start_color="FFA500", end_color="FFA500", fill_type="solid")
 
 # Valores que NO representan calles, colonias u otros componentes válidos de dirección
 VALORES_INVALIDOS = {
@@ -190,6 +192,13 @@ def preparar_columnas_coordenadas(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+def preparar_columnas_control(df: pd.DataFrame) -> pd.DataFrame:
+    """Inicializa columnas de trazabilidad para la geocodificación."""
+    df[COL_ENVIADO_API] = "NO"
+    df[COL_ESTADO] = ""
+    return df
+
+
 def geocodificar_direccion(cliente: googlemaps.Client, direccion: str) -> tuple[float | None, float | None, str]:
     """
     Consulta Google Maps Geocoding API.
@@ -256,26 +265,9 @@ def guardar_backup(df: pd.DataFrame, ruta_backup: Path) -> None:
     print(f"\n  >> Backup guardado: {ruta_backup}")
 
 
-def exportar_excel_con_resaltado(
-    df: pd.DataFrame,
-    ruta: Path,
-    indices_enviados_api: set[int],
-) -> None:
-    """
-    Exporta el dataset a Excel. Las filas enviadas a la API de Google
-    se resaltan en color naranja en toda la fila.
-    """
-    with pd.ExcelWriter(ruta, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name="Datos")
-        hoja = writer.sheets["Datos"]
-        num_columnas = len(df.columns)
-
-        for idx in indices_enviados_api:
-            if idx not in df.index:
-                continue
-            fila_excel = df.index.get_loc(idx) + 2  # +1 encabezado, +1 base 1
-            for col in range(1, num_columnas + 1):
-                hoja.cell(row=fila_excel, column=col).fill = FILL_NARANJA
+def exportar_csv_final(df: pd.DataFrame, ruta: Path) -> None:
+    """Exporta el dataset final en formato CSV."""
+    df.to_csv(ruta, index=False, encoding="utf-8-sig")
 
 
 def procesar_dataset(
@@ -314,6 +306,7 @@ def procesar_dataset(
     for idx in tqdm(indices, desc="Geocodificando", unit="registro"):
         fila = df.loc[idx]
         indices_enviados_api.add(idx)
+        df.at[idx, COL_ENVIADO_API] = "SI"
 
         direccion = construir_direccion(
             fila.get(COL_CALLE_1),
@@ -325,21 +318,21 @@ def procesar_dataset(
         print(f"\nFila {idx} | ID={fila.get('ID', 'N/A')}")
         print(f"  Dirección: {direccion or '(sin componentes válidos)'}")
 
-        lat, lon, estado = geocodificar_direccion(cliente, direccion or "")
+        lat, lon, estado_api = geocodificar_direccion(cliente, direccion or "")
 
-        if estado == "OK" and lat is not None and lon is not None:
+        if estado_api == "OK" and lat is not None and lon is not None:
             # El dataset original usa X=longitud, Y=latitud
             df.at[idx, COL_COORD_X] = lon
             df.at[idx, COL_COORD_Y] = lat
             print(f"  Resultado: OK -> lat={lat:.6f}, lon={lon:.6f}")
-        elif estado == "SIN_DIRECCION":
+        elif estado_api == "SIN_DIRECCION":
             df.at[idx, COL_COORD_X] = NO_ENCONTRADO
             df.at[idx, COL_COORD_Y] = NO_ENCONTRADO
             print("  Resultado: NO ENCONTRADO (dirección vacía o inválida)")
         else:
             df.at[idx, COL_COORD_X] = NO_ENCONTRADO
             df.at[idx, COL_COORD_Y] = NO_ENCONTRADO
-            print(f"  Resultado: NO ENCONTRADO ({estado})")
+            print(f"  Resultado: NO ENCONTRADO ({estado_api})")
 
         procesados_desde_ultimo_backup += 1
 
@@ -370,8 +363,7 @@ def parse_args() -> argparse.Namespace:
         "--output",
         "-o",
         default=None,
-        help="Ruta del Excel de salida (por defecto: <nombre>_geocodificado.xlsx). "
-        "Si indicas .csv, también se genera el .xlsx con filas resaltadas.",
+        help="Ruta del CSV de salida (por defecto: <nombre>_geocodificado.csv).",
     )
     parser.add_argument(
         "--backup",
@@ -420,18 +412,17 @@ def main() -> int:
         return 1
 
     ruta_salida = Path(args.output) if args.output else ruta_entrada.with_name(
-        f"{ruta_entrada.stem}_geocodificado.xlsx"
+        f"{ruta_entrada.stem}_geocodificado.csv"
     )
-    if ruta_salida.suffix.lower() == ".csv":
-        ruta_excel = ruta_salida.with_suffix(".xlsx")
-    else:
-        ruta_excel = ruta_salida if ruta_salida.suffix.lower() in {".xlsx", ".xls"} else ruta_salida.with_suffix(".xlsx")
+    if ruta_salida.suffix.lower() != ".csv":
+        ruta_salida = ruta_salida.with_suffix(".csv")
     ruta_backup = Path(args.backup)
 
     print(f"Cargando dataset: {ruta_entrada}")
     df = cargar_dataset(ruta_entrada, fila_encabezado=args.header_row)
     print(f"Filas cargadas: {len(df)}")
     df = preparar_columnas_coordenadas(df)
+    df = preparar_columnas_control(df)
 
     # Verificar columnas requeridas
     columnas_requeridas = [COL_CALLE_1, COL_CALLE_2, COL_COLONIA, COL_ALCALDIA, COL_COORD_X, COL_COORD_Y]
@@ -450,14 +441,11 @@ def main() -> int:
         limite=args.limite,
     )
 
-    # Guardado final: Excel con filas enviadas a la API en naranja
-    exportar_excel_con_resaltado(df, ruta_excel, indices_enviados_api)
-    print(f"\nProceso finalizado. Archivo exportado: {ruta_excel}")
-    print(f"  -> {len(indices_enviados_api)} fila(s) resaltada(s) en naranja (enviadas a la API)")
-
-    if ruta_salida.suffix.lower() == ".csv":
-        df.to_csv(ruta_salida, index=False, encoding="utf-8-sig")
-        print(f"  -> Copia CSV adicional: {ruta_salida}")
+    # Guardado final en CSV
+    exportar_csv_final(df, ruta_salida)
+    print(f"\nProceso finalizado. Archivo exportado: {ruta_salida}")
+    print(f"  -> {len(indices_enviados_api)} registro(s) marcados con ENVIADO_API=SI")
+    print(f"  -> Columna '{COL_ESTADO}' lista para verificación manual (correcto / incorrecto)")
 
     # Resumen
     ok_count = df[COL_COORD_X].apply(lambda v: isinstance(v, (int, float)) or (
