@@ -50,6 +50,10 @@ INTERVALO_BACKUP = 50
 # Pausa entre peticiones a Google (segundos) para respetar rate limits
 PAUSA_ENTRE_PETICIONES = 0.1
 
+# UTF-8 con BOM: Excel y la mayoría de herramientas en español lo reconocen correctamente
+CODIFICACION_CSV_SALIDA = "utf-8-sig"
+CODIFICACIONES_CSV_ENTRADA = ("utf-8-sig", "utf-8", "cp1252", "latin-1")
+
 # Valores que NO representan calles, colonias u otros componentes válidos de dirección
 VALORES_INVALIDOS = {
     "SIN REGISTRO",
@@ -172,6 +176,26 @@ def es_sin_registro(valor) -> bool:
     return str(valor).strip().upper() == SIN_REGISTRO
 
 
+def cargar_csv(ruta: Path, fila_encabezado: int = 0) -> pd.DataFrame:
+    """
+    Carga un CSV probando codificaciones comunes en español.
+    Prioriza UTF-8 con BOM (utf-8-sig) para acentos y ñ.
+    """
+    ultimo_error: UnicodeDecodeError | None = None
+    for encoding in CODIFICACIONES_CSV_ENTRADA:
+        try:
+            df = pd.read_csv(ruta, header=fila_encabezado, encoding=encoding)
+            if encoding != CODIFICACION_CSV_SALIDA:
+                print(f"  CSV leído con encoding: {encoding}")
+            return df
+        except UnicodeDecodeError as exc:
+            ultimo_error = exc
+
+    raise ValueError(
+        f"No se pudo leer {ruta} con las codificaciones: {CODIFICACIONES_CSV_ENTRADA}"
+    ) from ultimo_error
+
+
 def cargar_dataset(ruta: Path, hoja: str | int | None = 0, fila_encabezado: int = 1) -> pd.DataFrame:
     """
     Carga CSV o Excel. Para el archivo de muestra de la CDMX,
@@ -181,7 +205,7 @@ def cargar_dataset(ruta: Path, hoja: str | int | None = 0, fila_encabezado: int 
     if extension in {".xlsx", ".xls"}:
         return pd.read_excel(ruta, sheet_name=hoja, header=fila_encabezado)
     if extension == ".csv":
-        return pd.read_csv(ruta, header=fila_encabezado, encoding="utf-8")
+        return cargar_csv(ruta, fila_encabezado=fila_encabezado)
     raise ValueError(f"Formato no soportado: {extension}. Usa .csv, .xlsx o .xls")
 
 
@@ -259,15 +283,25 @@ def identificar_filas_a_geocodificar(df: pd.DataFrame) -> pd.Index:
     return df.index[mask_sin_registro & mask_direccion_completa]
 
 
+def guardar_csv(df: pd.DataFrame, ruta: Path) -> None:
+    """Exporta CSV en UTF-8 con BOM para visualización correcta de español en Excel."""
+    df.to_csv(
+        ruta,
+        index=False,
+        encoding=CODIFICACION_CSV_SALIDA,
+        lineterminator="\n",
+    )
+
+
 def guardar_backup(df: pd.DataFrame, ruta_backup: Path) -> None:
     """Guarda progreso intermedio en CSV."""
-    df.to_csv(ruta_backup, index=False, encoding="utf-8-sig")
+    guardar_csv(df, ruta_backup)
     print(f"\n  >> Backup guardado: {ruta_backup}")
 
 
 def exportar_csv_final(df: pd.DataFrame, ruta: Path) -> None:
     """Exporta el dataset final en formato CSV."""
-    df.to_csv(ruta, index=False, encoding="utf-8-sig")
+    guardar_csv(df, ruta)
 
 
 def procesar_dataset(
@@ -444,6 +478,7 @@ def main() -> int:
     # Guardado final en CSV
     exportar_csv_final(df, ruta_salida)
     print(f"\nProceso finalizado. Archivo exportado: {ruta_salida}")
+    print(f"  -> Codificación: {CODIFICACION_CSV_SALIDA} (UTF-8 con BOM, compatible con Excel en español)")
     print(f"  -> {len(indices_enviados_api)} registro(s) marcados con ENVIADO_API=SI")
     print(f"  -> Columna '{COL_ESTADO}' lista para verificación manual (correcto / incorrecto)")
 
