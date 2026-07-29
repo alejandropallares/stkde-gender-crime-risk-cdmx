@@ -25,13 +25,20 @@ Se elige el trío (kernel, h_s, h_t) con mayor log-verosimilitud leave-one-out
 
 Rejillas de búsqueda:
   h_s ∈ {0.5, 1.0, 1.5, 2.0, 3.0} km
-  h_t ∈ {24, 72, 168, 336, 720} horas (1 d – 30 d)
+  h_t ∈ {8760, 13140, 17520} horas (1 a. – 2 a.)
 
 El ajuste (fit_stkde) se ejecuta una sola vez sobre el dataset, se serializa
 en stkde_config.json y se reutiliza en cada consulta (sin recalcular LOO-CV).
 
-Parámetros seleccionados por LOO-CV (muestra n=400, estabilizado vs 800/1500):
-  kernel = gaussian, h_s = 3.0 km, h_t = 720 h
+Umbrales de riesgo (Low / Medium / High)
+----------------------------------------
+Se precomputan UNA vez evaluando ST-KDE en los ~6 090 centroides de la grilla
+CDMX (500 m). Los tertiles Q33/Q66 de densidades > 0 se guardan en
+stkde_config.json. Cada consulta solo calcula f(s*, t*) en el punto de la
+usuaria y lo clasifica con esos umbrales fijos.
+
+Parámetros: kernel / h_s / h_t se fijan por LOO-CV con h_t en escala anual
+(compatible con dataset multi-año 2020–2025 y consultas posteriores).
 
 Clasificación de riesgo
 -----------------------
@@ -71,12 +78,13 @@ SEARCH_RADIUS_KM = 3.0
 
 CV_SAMPLE_SIZE = 400
 SPATIAL_BW_CANDIDATES_KM = [0.5, 1.0, 1.5, 2.0, 3.0]
-TEMPORAL_BW_CANDIDATES_H = [24.0, 72.0, 168.0, 336.0, 720.0]
+# Escala anual (opción A): 1 año, 1.5 años, 2 años
+TEMPORAL_BW_CANDIDATES_H = [8760.0, 13140.0, 17520.0]
 
-# Valores por defecto = selección LOO-CV validada (gaussian, h_s=3, h_t=720)
+# Defaults provisionales; se sobrescriben tras LOO-CV + serialización
 DEFAULT_KERNEL = "gaussian"
 DEFAULT_SPATIAL_BW_KM = 3.0
-DEFAULT_TEMPORAL_BW_H = 720.0
+DEFAULT_TEMPORAL_BW_H = 8760.0  # 1 año
 
 # Compatibilidad con código/notebooks que referencían el nombre anterior
 FIXED_SPATIAL_BW_KM = DEFAULT_SPATIAL_BW_KM
@@ -106,6 +114,13 @@ class STKDEConfig:
     temporal_candidates_hours: list[float] = field(
         default_factory=lambda: list(TEMPORAL_BW_CANDIDATES_H)
     )
+    # Umbrales de riesgo precomputados sobre la grilla CDMX (6 090 celdas)
+    risk_q33: float | None = None
+    risk_q66: float | None = None
+    threshold_cell_count: int = 0
+    threshold_positive_count: int = 0
+    threshold_reference_datetime: str = ""
+    classification_method: str = ""
 
 
 _cached_config: Optional[STKDEConfig] = None
@@ -304,7 +319,78 @@ def load_stkde_config(path: Path | None = None) -> STKDEConfig:
     """Carga la configuración ST-KDE desde JSON."""
     src = path or CONFIG_PATH
     data = json.loads(src.read_text(encoding="utf-8"))
-    return STKDEConfig(**data)
+    # Ignorar claves desconocidas (compatibilidad hacia adelante)
+    from dataclasses import fields as dc_fields
+
+    valid = {f.name for f in dc_fields(STKDEConfig)}
+    filtered = {k: v for k, v in data.items() if k in valid}
+    return STKDEConfig(**filtered)
+
+
+def _threshold_reference_datetime(df: pd.DataFrame) -> datetime:
+    """
+    Instantáneo de calibración de umbrales: última fecha del dataset a las 12:00.
+    Alinea la superficie de riesgo con el régimen temporal más reciente de los datos.
+    """
+    last_date = pd.to_datetime(df[COL_DATE]).max()
+    return datetime(last_date.year, last_date.month, last_date.day, 12, 0, 0)
+
+
+def compute_grid_risk_thresholds(
+    df: pd.DataFrame,
+    config: STKDEConfig,
+    reference_datetime: datetime | None = None,
+) -> STKDEConfig:
+    """
+    Evalúa ST-KDE en todos los centroides de la grilla CDMX (~6 090) UNA vez
+    y fija tertiles Q33/Q66 para clasificar Low / Medium / High.
+    """
+    from cdmx_geo import get_grid_cells
+
+    if df.empty:
+        config.risk_q33 = 0.0
+        config.risk_q66 = 0.0
+        config.threshold_cell_count = 0
+        config.threshold_positive_count = 0
+        config.threshold_reference_datetime = ""
+        config.classification_method = "tertiles (sin datos)"
+        return config
+
+    cells = get_grid_cells()
+    lats = np.array([c["centroid_lat"] for c in cells], dtype=float)
+    lons = np.array([c["centroid_lon"] for c in cells], dtype=float)
+    ref_dt = reference_datetime or _threshold_reference_datetime(df)
+
+    print(
+        f"[ST-KDE] Precomputando umbrales sobre {len(cells):,} celdas "
+        f"× {len(df):,} incidentes (ref={ref_dt.strftime('%Y-%m-%d %H:00')})..."
+    )
+    densities = _stkde_weights(lats, lons, df, ref_dt, config)
+    positive = densities[densities > 0]
+
+    if len(positive) == 0:
+        q33, q66 = 0.0, 0.0
+    else:
+        q33, q66 = (float(x) for x in np.percentile(positive, [33.33, 66.67]))
+
+    config.risk_q33 = q33
+    config.risk_q66 = q66
+    config.threshold_cell_count = int(len(cells))
+    config.threshold_positive_count = int(len(positive))
+    config.threshold_reference_datetime = ref_dt.strftime("%Y-%m-%d %H:00")
+    config.classification_method = (
+        "tertiles Q33/Q66 sobre densidades > 0 en grilla CDMX 500 m "
+        f"({len(cells)} celdas, calibración offline)"
+    )
+    print(
+        f"[ST-KDE] Umbrales listos: Q33={q33:.8e}  Q66={q66:.8e}  "
+        f"(densidades > 0: {len(positive):,}/{len(cells):,})"
+    )
+    return config
+
+
+def config_has_thresholds(config: STKDEConfig) -> bool:
+    return config.risk_q33 is not None and config.risk_q66 is not None
 
 
 def get_stkde_config(
@@ -318,15 +404,27 @@ def get_stkde_config(
 
     - Si existe stkde_config.json (y no force_refit), la carga una vez.
     - Si no existe, ejecuta fit_stkde(df) una sola vez, serializa y cachea.
+    - Si faltan umbrales de riesgo, los precomputa sobre la grilla (una vez).
     """
     global _cached_config
     config_path = path or CONFIG_PATH
 
     if not force_refit:
-        if _cached_config is not None:
+        if _cached_config is not None and config_has_thresholds(_cached_config):
             return _cached_config
         if config_path.exists():
-            _cached_config = load_stkde_config(config_path)
+            config = load_stkde_config(config_path)
+            if config_has_thresholds(config):
+                _cached_config = config
+                return _cached_config
+            if df is None or df.empty:
+                raise ValueError(
+                    "stkde_config.json no tiene umbrales Q33/Q66 y se requiere "
+                    "un DataFrame para precomputarlos sobre la grilla."
+                )
+            config = compute_grid_risk_thresholds(df, config)
+            save_stkde_config(config, config_path)
+            _cached_config = config
             return _cached_config
 
     if df is None or df.empty:
@@ -335,6 +433,7 @@ def get_stkde_config(
         )
 
     config = fit_stkde(df)
+    config = compute_grid_risk_thresholds(df, config)
     save_stkde_config(config, config_path)
     _cached_config = config
     return config
@@ -342,21 +441,51 @@ def get_stkde_config(
 
 def ensure_stkde_config(df: pd.DataFrame, path: Path | None = None) -> STKDEConfig:
     """
-    Garantiza que exista configuración serializada.
-    Ejecuta fit_stkde una sola vez si el JSON aún no existe.
+    Garantiza configuración completa: LOO-CV + umbrales de grilla.
+    Solo calcula lo que falte (una vez) y serializa en stkde_config.json.
     """
     config_path = path or CONFIG_PATH
+
     if config_path.exists():
-        return get_stkde_config(path=config_path)
+        config = load_stkde_config(config_path)
+        if config_has_thresholds(config):
+            global _cached_config
+            _cached_config = config
+            print(
+                f"[ST-KDE] Config cargada: kernel={config.kernel_name}, "
+                f"h_s={config.h_spatial_km} km, h_t={config.h_temporal_hours} h, "
+                f"Q33={config.risk_q33:.4e}, Q66={config.risk_q66:.4e}"
+            )
+            return config
+
+        print("[ST-KDE] Config sin umbrales — precomputando grilla CDMX (una vez)...")
+        config = compute_grid_risk_thresholds(df, config)
+        save_stkde_config(config, config_path)
+        _cached_config = config
+        return config
 
     print(f"[ST-KDE] Ajustando parámetros LOO-CV (una vez) → {config_path.name}")
     config = get_stkde_config(df, force_refit=True, path=config_path)
     print(
         f"[ST-KDE] Config guardada: kernel={config.kernel_name}, "
         f"h_s={config.h_spatial_km} km, h_t={config.h_temporal_hours} h, "
-        f"LL={config.loo_log_likelihood:.4f}"
+        f"LL={config.loo_log_likelihood:.4f}, "
+        f"Q33={config.risk_q33:.4e}, Q66={config.risk_q66:.4e}"
     )
     return config
+
+
+def classify_density_score(density_score: float, config: STKDEConfig) -> str:
+    """Clasifica una densidad puntual con umbrales precomputados Q33/Q66."""
+    if config.risk_q33 is None or config.risk_q66 is None:
+        raise ValueError("La configuración no tiene umbrales de riesgo precomputados.")
+    if density_score <= 0:
+        return "Low"
+    if density_score <= config.risk_q33:
+        return "Low"
+    if density_score <= config.risk_q66:
+        return "Medium"
+    return "High"
 
 
 def _stkde_weights(
@@ -538,24 +667,7 @@ def estimate_risk(
     nearby_df = work_df[nearby_mask].copy()
     nearby_count = int(nearby_mask.sum())
 
-    positive = _stkde_weights(
-        work_df[COL_LAT].values[: min(200, len(work_df))],
-        work_df[COL_LON].values[: min(200, len(work_df))],
-        work_df,
-        target_date,
-        config,
-    )
-    positive = positive[positive > 0]
-    if len(positive) > 0:
-        q33, q66 = np.percentile(positive, [33.33, 66.67])
-        if density_score <= q33:
-            risk_level = "Low"
-        elif density_score <= q66:
-            risk_level = "Medium"
-        else:
-            risk_level = "High"
-    else:
-        risk_level = "Low"
+    risk_level = classify_density_score(density_score, config)
 
     probability = round(min(max(density_score / (density_score + 0.01), 0.01), 0.99), 4)
 
@@ -596,6 +708,13 @@ def estimate_risk(
         "bandwidth_spatial_km": config.h_spatial_km,
         "bandwidth_temporal_hours": config.h_temporal_hours,
         "reference_datetime": target_date.strftime("%Y-%m-%d %H:00"),
+        "classification": {
+            "method": config.classification_method,
+            "q33": config.risk_q33,
+            "q66": config.risk_q66,
+            "threshold_cell_count": config.threshold_cell_count,
+            "threshold_reference_datetime": config.threshold_reference_datetime,
+        },
     }
 
 
